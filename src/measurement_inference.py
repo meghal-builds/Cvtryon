@@ -1,125 +1,131 @@
-"""Measurement Inference Module"""
+"""Measurement Inference Module - WORKING VERSION"""
 
+from typing import Tuple, List
 import numpy as np
-from typing import Optional
 
-from src.models import Measurements, PoseResult, SegmentationResult
-from src.pose_detection import get_keypoint_coordinate, calculate_torso_length
+from src.models import Measurements, SegmentationResult, PoseResult, Keypoint
+
+PIXELS_PER_CM = 7.0
+SHOULDER_TO_CIRCUMFERENCE = 2.3
 
 
-def infer_measurements(
-    pose_result: PoseResult,
-    segmentation_result: SegmentationResult,
-    pixels_per_cm: float = 10.0
-) -> Measurements:
-    """
-    Infer body measurements from pose and segmentation
+def calculate_torso_length(keypoints: List[Keypoint]) -> float:
+    """Calculate torso length from keypoints"""
+    left_shoulder = next((kp for kp in keypoints if kp.name == 'left_shoulder'), None)
+    right_shoulder = next((kp for kp in keypoints if kp.name == 'right_shoulder'), None)
+    left_hip = next((kp for kp in keypoints if kp.name == 'left_hip'), None)
+    right_hip = next((kp for kp in keypoints if kp.name == 'right_hip'), None)
     
-    Args:
-        pose_result: Result from pose detection
-        segmentation_result: Result from segmentation
-        pixels_per_cm: Conversion factor from pixels to cm
-        
-    Returns:
-        Measurements object
-    """
-    # Calculate shoulder width
-    shoulder_width_cm = (pose_result.shoulder_width_px / pixels_per_cm)
+    if not (left_shoulder and right_shoulder and left_hip and right_hip):
+        return 0.0
     
-    # Calculate chest circumference (estimated from shoulder and torso)
-    torso_mask = segmentation_result.body_parts.get('torso')
-    chest_circumference_cm = 0.0
+    shoulder_y = (left_shoulder.y + right_shoulder.y) / 2
+    hip_y = (left_hip.y + right_hip.y) / 2
+    torso_length = abs(hip_y - shoulder_y)
     
-    if torso_mask is not None:
-        # Estimate from torso width
-        torso_width = np.sum(np.any(torso_mask > 0, axis=0))
-        chest_circumference_cm = (torso_width / pixels_per_cm) * 2.5  # Empirical factor
+    return torso_length
+
+
+def infer_measurements(pose_result: PoseResult, seg_result: SegmentationResult) -> Measurements:
+    """Infer body measurements from pose and segmentation"""
+    if not pose_result or not seg_result:
+        raise ValueError("Both pose and segmentation results required")
     
-    # Calculate torso length
-    torso_length_cm = 0.0
-    torso_length_px = calculate_torso_length(pose_result)
+    shoulder_width_px = pose_result.shoulder_width_px
+    torso_length_px = calculate_torso_length(pose_result.keypoints)
+    chest_width_px = shoulder_width_px * 1.15
     
-    if torso_length_px is not None:
-        torso_length_cm = torso_length_px / pixels_per_cm
+    shoulder_width_cm = shoulder_width_px / PIXELS_PER_CM
+    torso_length_cm = torso_length_px / PIXELS_PER_CM
+    chest_circumference_cm = chest_width_px / PIXELS_PER_CM * SHOULDER_TO_CIRCUMFERENCE
     
-    # Calculate confidence
-    confidence = calculate_measurement_confidence(
-        pose_result,
-        segmentation_result
-    )
+    confidence = _calculate_confidence(pose_result, shoulder_width_cm, chest_circumference_cm)
     
     return Measurements(
-        shoulder_width_cm=shoulder_width_cm,
-        chest_circumference_cm=chest_circumference_cm,
-        torso_length_cm=torso_length_cm,
+        shoulder_width_cm=round(shoulder_width_cm, 2),
+        chest_circumference_cm=round(chest_circumference_cm, 2),
+        torso_length_cm=round(torso_length_cm, 2),
         source='inferred',
-        confidence=confidence
+        confidence=round(confidence, 2)
     )
 
 
-def calculate_measurement_confidence(
-    pose_result: PoseResult,
-    segmentation_result: SegmentationResult
-) -> float:
-    """
-    Calculate confidence in measurements
+def _calculate_confidence(pose_result: PoseResult, shoulder_width_cm: float, chest_circumference_cm: float) -> float:
+    """Calculate measurement confidence"""
+    confidence = 0.5
     
-    Args:
-        pose_result: Result from pose detection
-        segmentation_result: Result from segmentation
-        
-    Returns:
-        Confidence score (0.0 to 1.0)
-    """
-    confidence = 1.0
+    keypoint_bonus = min(len(pose_result.keypoints) / 20.0, 0.3)
+    confidence += keypoint_bonus
     
-    # Reduce confidence if pose is not frontal
-    if not pose_result.is_frontal:
-        confidence *= 0.7
+    if pose_result.is_frontal:
+        confidence += 0.1
     
-    # Reduce confidence if segmentation confidence is low
-    confidence *= segmentation_result.confidence
+    if 35 <= shoulder_width_cm <= 50:
+        confidence += 0.05
     
-    # Reduce confidence if too few keypoints
-    if len(pose_result.keypoints) < 10:
-        confidence *= 0.9
+    if 75 <= chest_circumference_cm <= 120:
+        confidence += 0.05
     
-    return max(0.0, min(1.0, confidence))
+    return min(confidence, 0.95)
 
 
-def validate_measurements(measurements: Measurements) -> tuple:
-    """
-    Validate measurements are in reasonable ranges
+def calculate_measurement_confidence(measurements: Measurements) -> float:
+    """Get confidence from measurements"""
+    return measurements.confidence
+
+
+def calculate_measurement_fit(user_value: float, size_value: float, tolerance_percent: float = 5.0) -> float:
+    """Calculate fit score for a single measurement"""
+    if size_value == 0:
+        return 0.0
     
-    Args:
-        measurements: Measurements object
-        
-    Returns:
-        Tuple of (is_valid, errors)
-    """
+    difference_percent = abs(user_value - size_value) / size_value * 100
+    
+    if difference_percent == 0:
+        return 1.0
+    
+    max_difference = tolerance_percent * 2
+    
+    if difference_percent >= max_difference:
+        return 0.0
+    
+    score = 1.0 - (difference_percent / max_difference)
+    return max(0.0, min(1.0, score))
+
+
+def validate_measurements(measurements: Measurements) -> Tuple[bool, str]:
+    """Validate that measurements are in reasonable range"""
     errors = []
     
-    # Validate shoulder width (30-60 cm)
-    if measurements.shoulder_width_cm < 30 or measurements.shoulder_width_cm > 60:
-        errors.append(
-            f"Invalid shoulder width: {measurements.shoulder_width_cm:.1f}cm "
-            f"(expected: 30-60cm)"
-        )
+    if not (30 <= measurements.shoulder_width_cm <= 55):
+        errors.append(f"Invalid shoulder width: {measurements.shoulder_width_cm}cm (expected 30-55cm)")
     
-    # Validate chest circumference (70-150 cm)
-    if measurements.chest_circumference_cm < 70 or measurements.chest_circumference_cm > 150:
-        errors.append(
-            f"Invalid chest circumference: {measurements.chest_circumference_cm:.1f}cm "
-            f"(expected: 70-150cm)"
-        )
+    if not (70 <= measurements.chest_circumference_cm <= 130):
+        errors.append(f"Invalid chest circumference: {measurements.chest_circumference_cm}cm (expected 70-130cm)")
     
-    # Validate torso length (40-80 cm)
-    if measurements.torso_length_cm < 40 or measurements.torso_length_cm > 80:
-        errors.append(
-            f"Invalid torso length: {measurements.torso_length_cm:.1f}cm "
-            f"(expected: 40-80cm)"
-        )
+    if not (40 <= measurements.torso_length_cm <= 80):
+        errors.append(f"Invalid torso length: {measurements.torso_length_cm}cm (expected 40-80cm)")
     
     is_valid = len(errors) == 0
+    error_message = "; ".join(errors) if errors else ""
     
-    return is_valid, errors
+    return is_valid, error_message
+
+
+def recalibrate_pixels_per_cm(reference_width_cm: float, measured_width_px: float) -> float:
+    """Recalibrate pixels-per-cm ratio"""
+    return measured_width_px / reference_width_cm
+
+
+def print_measurement_debug_info(pose_result: PoseResult, measurements: Measurements):
+    """Print debug information about measurements"""
+    print("\n" + "="*70)
+    print("MEASUREMENT DEBUG INFO")
+    print("="*70)
+    print(f"Shoulder Width (px): {pose_result.shoulder_width_px:.2f}")
+    print(f"Shoulder Width (cm): {measurements.shoulder_width_cm:.2f}")
+    print(f"Pixels per cm: {PIXELS_PER_CM}")
+    print(f"\nChest Circumference (cm): {measurements.chest_circumference_cm:.2f}")
+    print(f"Torso Length (cm): {measurements.torso_length_cm:.2f}")
+    print(f"Confidence: {measurements.confidence * 100:.1f}%")
+    print("="*70 + "\n")
